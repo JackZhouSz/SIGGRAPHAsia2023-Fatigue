@@ -21,6 +21,7 @@ INSTALL_REQUIRES = [
     "hydra-core>=1.1",
     "rl-games==1.5.2",
     "pyvirtualdisplay",
+    "numpy==1.20",
     ]
 
 
@@ -33,7 +34,7 @@ setup(
     description="Benchmark environments for high-speed robot learning in NVIDIA IsaacGym.",
     keywords=["robotics", "rl"],
     include_package_data=True,
-    python_requires=">=3.6.*",
+    python_requires=">=3.6",
     install_requires=INSTALL_REQUIRES,
     packages=find_packages("."),
     classifiers=["Natural Language :: English", "Programming Language :: Python :: 3.7, 3.8"],

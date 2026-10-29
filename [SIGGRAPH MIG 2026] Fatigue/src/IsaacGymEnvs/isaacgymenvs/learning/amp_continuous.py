@@ -507,7 +507,11 @@ class AMPAgent(common_agent.CommonAgent):
         elif self._regterm == "multiplicative":
             combined_rewards = mean_rcs * self._disc_reward_w * disc_r
         elif self._regterm == "multiplicative2":
+            print("Multiplicative2")
             combined_rewards = (1 - mean_rcs) * self._task_reward_w * task_rewards + mean_rcs * self._disc_reward_w * disc_r
+        elif self._regterm == "multiplicative3":
+            combined_rewards = mean_rcs * self._task_reward_w * task_rewards + (1 - mean_rcs) * self._disc_reward_w * disc_r
+            print("Multiplicative3")
         else:
             raise NotImplementedError
 

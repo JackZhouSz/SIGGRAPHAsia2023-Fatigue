@@ -49,7 +49,9 @@ If you find this code useful in your research, please cite:
 
 ### About this repository
 
-This repository contains an implementation of the code for our [SIGGRAPH Asia paper](https://dl.acm.org/doi/pdf/10.1145/3610548.3618176) "Discovering Fatigued Animations for Virtual Character Animation".
+This repository contains an implementation of the code for our [SIGGRAPH Asia paper](https://dl.acm.org/doi/pdf/10.1145/3610548.3618176) "Discovering Fatigued Animations for Virtual Character Animation", and its extension published at **MIG 2026**, which replaces the single-pool 3CC-r model with a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
+
+**Note on defaults:** `useFGS` and `localGroupFatigue` now default to `True`. To reproduce the original SIGGRAPH Asia 2023 behaviour (uniform per-DoF 3CC-r), append `++task.env.useFGS=False ++task.env.localGroupFatigue=False` to the commands below.
 
 ### Installation
 
@@ -145,7 +147,7 @@ python train.py seed=477 task=HumanoidAMPHandsFatigue train=HumanoidAMPPPOLowGPF
 
 </details>
 
-<details>s
+<details>
 <summary><b>Finetune Goal-Conditioned Locomotion with Fatigue</b></summary>
 
 To fine-tune an expert model trained on the run motion with fatigue, we use the following command:
@@ -169,6 +171,74 @@ python train.py task=AntFatigue task.env.fatigueF=0.4 task.env.fatigueR=0.1 task
 </pre>
 
 **Note:** For training or fine-tuning we set ```task.env.randomizeFatigueProb=1``` to have a random fatigue initialization at every environment reset for maximizing diversity during training.
+
+</details>
+
+### Fiber-type fatigue model (FGS, MIG 2026)
+
+FGS splits each DoF's single 3CC-r pool into three motor-unit pools, one per fiber type (I, IIa, IIx), each with its own `MA`, `MF` and `MR` compartments and its own fatigue/recovery rates. Fiber types are recruited by size principle: the brain effort `BE = TL / RC` is compared against recruitment thresholds, so type I is always active, IIa joins above the first threshold and IIx above the second. The DoF's residual capacity `RC` is the fiber-percentage-weighted sum of the per-type capacities. The per-type rate multipliers are normalised to a unit P-weighted mean, so enabling FGS redistributes fatigue between fiber types without changing the aggregate rate.
+
+FGS is applied at inference on top of the existing fatigue policies, so the pre-trained checkpoints above can be used directly.
+
+<details>
+<summary><b>Run Fatigued Tornado Kick with FGS</b></summary>
+
+<pre>
+python train.py seed=477 task=HumanoidAMPHandsFatigue train=HumanoidAMPPPOLowGPFatigue headless=False num_envs=1 test=True checkpoint=runs/wushu_fatigue/nn/wushu_fatigue_6000.pth task.env.motion_file=amp_humanoid_wushu_kick.npy task.env.useFatigue=True task.env.visualizeFatigue=True task.env.showSkyWall=True <b>++task.env.useFGS=True ++task.env.localGroupFatigue=True</b>
+</pre>
+</details>
+
+<details>
+<summary><b>FGS parameters</b></summary>
+
+All parameters are set with `++task.env.<name>=<value>`. Lists use double quotes and no spaces, e.g. `++task.env.F_mu_multipliers="[0.690,1.034,1.379]"`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `useFGS` | `True` | Use the fiber-type model instead of single-pool 3CC-r. |
+| `localGroupFatigue` | `True` | Per-body-group F, R, r instead of uniform values. |
+| `fatigue_F_groups` | `[0.848,3.394,3.394,1.697,1.697]` | F per group: torso+head, right arm, left arm, right leg, left leg. |
+| `fatigue_R_groups` | `[0.085,0.424,0.424,0.085,0.085]` | R per group. |
+| `fatigue_r_groups` | `[1.0,1.0,1.0,1.0,1.0]` | r per group. |
+| `mu_percentages_per_dof` | `[[0.4,0.3,0.3]]` | Fiber composition (I, IIa, IIx), normalised to sum to 1. |
+| `mu_be_recruitment_thresholds` | `[33.3,66.6]` | Brain effort thresholds at which IIa and IIx are recruited. |
+| `F_mu_multipliers` | `[0.690,1.034,1.379]` | F multiplier per fiber type. |
+| `R_mu_multipliers` | `[1.099,0.989,0.879]` | R multiplier per fiber type. |
+| `r_mu_multipliers` | `[1.136,1.023,0.796]` | r multiplier per fiber type. |
+| `initialMF` | `-1` | If `>= 0`, start every episode with this fixed fatigue level (0-100) instead of random initialisation. |
+
+</details>
+
+<details>
+<summary><b>Resolution ablation</b></summary>
+
+`run_ablation.sh` runs the tornado kick under four fatigue models with the same checkpoint, seed and episode length:
+
+| Rung | Flags | Model |
+|---|---|---|
+| (i) `uniform` | `useFGS=False localGroupFatigue=False` | Per-DoF 3CC-r, uniform coefficients (SIGGRAPH Asia 2023). |
+| (0) `loaddep` | `useFGS=False localGroupFatigue=True loadDependentRate=True` | Single pool whose F and R scale with instantaneous load over the same range as the FGS multipliers. |
+| (ii) `pergroup` | `useFGS=False localGroupFatigue=True` | Per-group coefficients, single pool. |
+| (iii) `fgs` | `useFGS=True localGroupFatigue=True` | Full FGS. |
+
+<pre>
+bash run_ablation.sh          # all rungs
+bash run_ablation.sh fgs      # one rung: uniform | loaddep | pergroup | fgs
+python check_exposure.py
+</pre>
+
+Run `check_exposure.py` before interpreting the results: it verifies that cumulative knee exposure is matched across rungs, so differences reflect the fatigue representation rather than the overall fatigue rate.
+
+</details>
+
+<details>
+<summary><b>Logging and timing</b></summary>
+
+| Parameter | Default | Description |
+|---|---|---|
+| `logRC` / `logRCPath` / `logRCEnvs` | `True` / `walk_fgs_fat.csv` / `8` | Per-frame CSV of RC, joint angles, key body heights, root position and (with FGS) per-fiber `MF`. |
+| `logDuty` / `logDutyPath` / `logDutyWindow` | `False` / `duty_log_FGS_P_02_04_04.csv` / `200` | Windowed recruitment duty cycle per joint and fiber type (FGS only). |
+| `timeFatigue` / `timeFatigueSync` / `timeFatigueReport` | `False` / `False` / `500` | Wall-clock cost of the fatigue update. Set `timeFatigueSync=True` on GPU for meaningful numbers; leave timing off for training. |
 
 </details>
 

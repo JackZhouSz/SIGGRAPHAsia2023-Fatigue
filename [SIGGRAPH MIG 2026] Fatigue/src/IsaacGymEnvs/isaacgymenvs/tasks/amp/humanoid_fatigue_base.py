@@ -27,7 +27,9 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+import csv
 import numpy as np
+import time
 import os
 import torch
 
@@ -132,6 +134,9 @@ JOINT_NAMES = [
     'left_ankle_y',
     'left_ankle_z'
 ]
+
+MU_TYPE_NAMES = ['I', 'IIa', 'IIx']
+
 
 def convert_to_body_map(dof_map):
     body_map = {}
@@ -239,17 +244,283 @@ class HumanoidFatigueBase(VecTask):
         self.LR = 10
 
         # to play around with per-part fatigue constants
-        self.F = torch.ones(self.num_dof, device=self.device, requires_grad=False) * self.cfg["env"]["fatigueF"]
-        self.r = torch.ones(self.num_dof, device=self.device, requires_grad=False) * self.cfg["env"]["fatigue_r"]
-        self.R = torch.ones(self.num_dof, device=self.device, requires_grad=False) * self.F * self.cfg["env"]["fatigueR"]
+        self.F_base = torch.ones(self.num_dof * self.num3CC, device=self.device, requires_grad=False) * self.cfg["env"]["fatigueF"]
+        self.r_base = torch.ones(self.num_dof * self.num3CC, device=self.device, requires_grad=False) * self.cfg["env"]["fatigue_r"]
+        self.R_base = torch.ones(self.num_dof * self.num3CC, device=self.device, requires_grad=False) * self.F_base * self.cfg["env"]["fatigueR"]
+
+        # Per-group fatigue parameters (example for 5 groups)
+        # Order: Torso+Head, Right Arm, Left Arm, Right Leg, Left Leg
+        self.fatigue_F_groups = self.cfg["env"].get("fatigue_F_groups", [0.848, 3.394, 3.394, 1.697, 1.697])
+        self.fatigue_R_groups = self.cfg["env"].get("fatigue_R_groups", [0.085, 0.424, 0.424, 0.085, 0.085])
+        self.fatigue_r_groups = self.cfg["env"].get("fatigue_r_groups", [1.0, 1.0, 1.0, 1.0, 1.0])
+
+        self.local_group_fatigue = self.cfg["env"].get("localGroupFatigue", True)
+        print(self.local_group_fatigue)
+        self.use_FGS = self.cfg["env"].get("useFGS", True)
+
+        # Load-dependent single-compartment baseline: a SINGLE pool per DoF whose
+        # rate varies with instantaneous load, rather than a fixed rate. This is
+        # the baseline requested in review: it reproduces the rate modulation of
+        # FGS (faster fatigue and slower recovery under heavier load) WITHOUT the
+        # reserve structure, since one pool has nothing to withhold. Mutually
+        # exclusive with useFGS.
+        self.load_dep_rate = self.cfg["env"].get("loadDependentRate", False)
+        if self.load_dep_rate and self.use_FGS:
+            print("Warning: loadDependentRate and useFGS are mutually exclusive; "
+                  "ignoring loadDependentRate.")
+            self.load_dep_rate = False
+        # Spans matched to the FGS lambda range (F 0.690-1.379, R 1.099-0.879),
+        # centred so the multiplier is exactly 1.0 at u = loadDepCenter.
+        self._ld_span_F = float(self.cfg["env"].get("loadDepSpanF", 0.689))
+        self._ld_span_R = float(self.cfg["env"].get("loadDepSpanR", -0.220))
+        self._ld_center = float(self.cfg["env"].get("loadDepCenter", 0.5))
+
+        if self.cfg["env"]["useFatigue"] and self.local_group_fatigue:
+            self._initialize_grouped_fatigue_parameters()
+
+        # Example MU types
+        self.mu_types = ['type_i', 'type_iia', 'type_iix']
+        self.num_mu_types = len(self.mu_types)
+        # MU percentages per DOF: (num_dof, num_mu_types)
+        mu_percentages_config = self.cfg["env"].get("mu_percentages_per_dof", [[0.4, 0.3, 0.3]])
+        self.mu_percentages_per_dof = torch.zeros((self.num_dof, self.num_mu_types), device=self.device, dtype=torch.float)
+        if len(mu_percentages_config) == 1 and isinstance(mu_percentages_config[0], list) and len(mu_percentages_config[0]) == self.num_mu_types:
+            self.mu_percentages_per_dof[:] = torch.tensor(mu_percentages_config[0], device=self.device, dtype=torch.float)
+        else:
+            print("Warning: mu_percentages_per_dof using fallback global default. Complex config not fully implemented.")
+            self.mu_percentages_per_dof[:] = torch.tensor([0.4, 0.3, 0.3], device=self.device, dtype=torch.float) # Fallback
+
+        # Normalize percentages to sum to 1 for each DOF
+        sums = torch.sum(self.mu_percentages_per_dof, dim=1, keepdim=True)
+        sums[sums == 0] = 1.0 # Avoid division by zero
+        self.mu_percentages_per_dof /= sums
+
+        # Fatigue parameter multipliers for each MU type.
+        # NOTE: these are normalised to unit P-weighted mean so that enabling FGS
+        # redistributes fatigue between fiber types WITHOUT changing the aggregate
+        # rate. Published ratios (1 : 1.5 : 2 for F) are preserved.
+        self.F_mu_multipliers = torch.tensor(self.cfg["env"].get("F_mu_multipliers", [0.690, 1.034, 1.379]), device=self.device, dtype=torch.float)
+        self.R_mu_multipliers = torch.tensor(self.cfg["env"].get("R_mu_multipliers", [1.099, 0.989, 0.879]), device=self.device, dtype=torch.float)
+        self.r_mu_multipliers = torch.tensor(self.cfg["env"].get("r_mu_multipliers", [1.136, 1.023, 0.796]), device=self.device, dtype=torch.float)
+
+        # Dynamically changing fatigue variables per MU type (0-100 for each type's own pool)
+        self.MA_mu = torch.zeros((self.num_envs, self.num_dof, self.num_mu_types), device=self.device, requires_grad=False)
+        self.MF_mu = torch.zeros((self.num_envs, self.num_dof, self.num_mu_types), device=self.device, requires_grad=False)
+        self.MR_mu = torch.ones((self.num_envs, self.num_dof, self.num_mu_types), device=self.device, requires_grad=False) * 100.0
+
+        # Recruitment thresholds for MU types based on Brain Effort (BE)
+        self.mu_be_recruitment_thresholds = torch.tensor(self.cfg["env"].get("mu_be_recruitment_thresholds", [33.3, 66.6]), device=self.device, dtype=torch.float)
+        if self.use_FGS and self.num_mu_types == 3:
+            if self.mu_be_recruitment_thresholds.shape[0] != 2:
+                print(f"Warning: mu_be_recruitment_thresholds in config has {self.mu_be_recruitment_thresholds.shape[0]} values, but 2 are expected for 3 MU types. Using default [33.3, 66.6].")
+                self.mu_be_recruitment_thresholds = torch.tensor([33.3, 66.6], device=self.device, dtype=torch.float)
+        elif self.use_FGS and self.num_mu_types != 3:
+            print(f"Warning: MU recruitment logic with BE thresholds is designed for 3 MU types, but found {self.num_mu_types}. Thresholds may not apply as intended if use_FGS is True.")
 
         self.target_dir = torch.zeros((self.num_envs, 2), device=self.device, requires_grad=False)
 
         self._body_to_dof_map = convert_to_body_map(DOF_TO_BODY_MAP)
 
+        # ------------------------------ logging ------------------------------
+        self._log_rc     = self.cfg["env"].get("logRC", True)
+        self._n_log_envs = self.cfg["env"].get("logRCEnvs", 8)
+        self._log_path   = self.cfg["env"].get("logRCPath", "walk_fgs_fat.csv")
+        self._log_rows   = []
+        # episode id per env, bumped on reset so traces can be segmented
+        self._log_episode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # windowed motor-unit recruitment duty cycle
+        self._log_duty        = self.cfg["env"].get("logDuty", False)
+        self._duty_window     = int(self.cfg["env"].get("logDutyWindow", 200))
+        self._duty_path       = self.cfg["env"].get("logDutyPath", "duty_log_FGS_P_02_04_04.csv")
+        self._duty_rows       = []
+        self._duty_window_idx = 0
+        self._rec_count       = torch.zeros(self.num_mu_types, self.num_dof, device=self.device)
+        self._rec_steps       = 0
+
+        # ------------------------- timing -------------------------
+        # Wall-clock cost of the fatigue update, for the real-time claim.
+        # CUDA kernels are asynchronous, so we synchronise around the timed
+        # region; without this the measurement is meaningless. Synchronising
+        # costs throughput, so leave timeFatigue off for training runs.
+        self._time_fatigue = self.cfg["env"].get("timeFatigue", False)
+        self._time_sync    = self.cfg["env"].get("timeFatigueSync", False)
+        self._time_report  = int(self.cfg["env"].get("timeFatigueReport", 500))
+        self._t_fat_total  = 0.0
+        self._t_step_total = 0.0
+        self._t_n          = 0
+        self._t_step_mark  = None
+        self._is_cuda      = 'cuda' in str(self.device)
+
+        # label the run so the three ablation rungs are distinguishable
+        if self.use_FGS:
+            self._condition = "FGS"
+        elif self.load_dep_rate:
+            self._condition = "load_dep_3CCr"
+        elif self.local_group_fatigue:
+            self._condition = "per_group"
+        else:
+            self._condition = "uniform_3CCr"
+        if self._log_rc:
+            print(f"[log] condition={self._condition} rc -> {self._log_path}")
+            if self.use_FGS and self._log_duty:
+                print(f"[log] duty (window={self._duty_window}) -> {self._duty_path}")
+        # ---------------------------------------------------------------------
+
         if self.viewer != None:
             self._init_camera()
 
+        return
+
+    # ------------------------------- timing --------------------------------
+
+    def _sync(self):
+        if self._time_sync and self._is_cuda:
+            torch.cuda.synchronize()
+
+    def _report_timing(self):
+        if self._t_n == 0:
+            return
+        fat_us  = 1e6 * self._t_fat_total / self._t_n
+        step_us = 1e6 * self._t_step_total / self._t_n if self._t_step_total else float('nan')
+        share   = 100.0 * self._t_fat_total / self._t_step_total if self._t_step_total else float('nan')
+        print(f"[timing] {self._condition}: fatigue update {fat_us:8.1f} us/step "
+              f"({fat_us / max(self.num_envs, 1) * 1e3:7.2f} ns/env), "
+              f"full step {step_us:9.1f} us, fatigue share {share:5.2f}%  "
+              f"[n={self._t_n}, envs={self.num_envs}, sync={self._time_sync}]")
+
+    # ------------------------------ RC logging ------------------------------
+
+    def _record_rc(self):
+        n = min(self._n_log_envs, self.num_envs)
+        rc = self.RC[:n].detach().cpu().numpy()
+        q  = self._dof_pos[:n].detach().cpu().numpy()
+        key_h = self._rigid_body_pos[:n][:, self._key_body_ids, 2].detach().cpu().numpy()
+        step = self.progress_buf[:n].detach().cpu().numpy()
+        ep = self._log_episode[:n].detach().cpu().numpy()
+        root = self._root_states[:n, 0:3].detach().cpu().numpy()
+        term = self._terminate_buf[:n].detach().cpu().numpy()
+        mf = self.MF_mu[:n].detach().cpu().numpy().reshape(n, -1) if self.use_FGS else None
+        for e in range(n):
+            row = [self._condition, e, int(ep[e]), int(step[e]), int(term[e])]
+            row += rc[e].tolist() + q[e].tolist() + key_h[e].tolist()
+            row += root[e].tolist()
+            if mf is not None:
+                row += mf[e].tolist()
+            self._log_rows.append(row)
+        if int(self.progress_buf[0].item()) >= self.max_episode_length - 1:
+            self._flush_rc()
+
+    def _flush_rc(self):
+        if not self._log_rows:
+            return
+        new = not os.path.exists(self._log_path)
+        with open(self._log_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if new:
+                hdr = ['condition', 'env', 'episode', 'frame', 'terminated']
+                hdr += [f'RC_{j}' for j in JOINT_NAMES]
+                hdr += [f'q_{j}'  for j in JOINT_NAMES]
+                hdr += [f'{b}_height' for b in KEY_BODY_NAMES]
+                hdr += ['root_x', 'root_y', 'root_z']
+                if self.use_FGS:
+                    hdr += [f'MF_{j}_{t}' for j in JOINT_NAMES
+                                          for t in MU_TYPE_NAMES]
+                w.writerow(hdr)
+            w.writerows(self._log_rows)
+        self._log_rows = []
+
+    # ------------------- windowed recruitment duty cycle -------------------
+
+    def _accumulate_duty(self, masks):
+        """masks: list of (num_envs, num_dof) bool tensors, one per MU type."""
+        for i, m in enumerate(masks):
+            self._rec_count[i] += m.float().mean(0)
+        self._rec_steps += 1
+        if self._rec_steps >= self._duty_window:
+            duty = (self._rec_count / self._rec_steps).cpu().numpy()
+            row = [self._condition, self._duty_window_idx,
+                   self._duty_window_idx * self._duty_window]
+            # column order matches the header: joint-major, then MU type
+            for j in range(self.num_dof):
+                for t in range(self.num_mu_types):
+                    row.append(float(duty[t, j]))
+            self._duty_rows.append(row)
+            for j in [7, 14, 17, 24]:   # r_shoulder_y, r_hip_x, r_knee, l_knee
+                print(f"[w{self._duty_window_idx:02d}] {JOINT_NAMES[j]:16s} "
+                      f"I {duty[0, j]:.3f}  IIa {duty[1, j]:.3f}  IIx {duty[2, j]:.3f}")
+            self._duty_window_idx += 1
+            self._rec_count.zero_()          # true window, not cumulative
+            self._rec_steps = 0
+            self._flush_duty()
+
+    def _flush_duty(self):
+        if not self._duty_rows:
+            return
+        new = not os.path.exists(self._duty_path)
+        with open(self._duty_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if new:
+                hdr = ['condition', 'window', 'frame_start']
+                hdr += [f'duty_{j}_{t}' for j in JOINT_NAMES
+                                        for t in MU_TYPE_NAMES]
+                w.writerow(hdr)
+            w.writerows(self._duty_rows)
+        self._duty_rows = []
+
+    def close(self):
+        try:
+            if getattr(self, '_time_fatigue', False):
+                self._report_timing()
+        except Exception:
+            pass
+        # make sure buffered tails reach disk
+        try:
+            if getattr(self, '_log_rc', False):
+                self._flush_rc()
+            if getattr(self, '_log_duty', False):
+                self._flush_duty()
+        except Exception:
+            pass
+        parent_close = getattr(super(), 'close', None)
+        if callable(parent_close):
+            parent_close()
+
+    def __del__(self):
+        try:
+            if getattr(self, '_log_rc', False):
+                self._flush_rc()
+            if getattr(self, '_log_duty', False):
+                self._flush_duty()
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+
+    def _initialize_grouped_fatigue_parameters(self):
+        torso_head_indices = list(range(6))
+        right_arm_indices = list(range(6,10))
+        left_arm_indices = list(range(10,14))
+        right_leg_indices = list(range(14,21))
+        left_leg_indices = list(range(21,28))
+
+        index_list = [torso_head_indices,
+                      right_arm_indices,
+                      left_arm_indices,
+                      right_leg_indices,
+                      left_leg_indices]
+
+        for i, indices in enumerate(index_list):
+            self.F_base[indices] = self.fatigue_F_groups[i]
+            self.R_base[indices] = self.fatigue_R_groups[i]
+            self.r_base[indices] = self.fatigue_r_groups[i]
+
+        print("self.F_base (per DOF after grouping):")
+        print(self.F_base)
+        print("self.R_base (per DOF after grouping):")
+        print(self.R_base)
+        print("self.r_base (per DOF after grouping):")
+        print(self.r_base)
         return
 
     def get_obs_size(self):
@@ -297,7 +568,7 @@ class HumanoidFatigueBase(VecTask):
             self._create_wall_box(self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
         return
-    
+
     def _create_wall_box(self, spacing, num_per_row):
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         upper = gymapi.Vec3(spacing, spacing, spacing)
@@ -355,7 +626,6 @@ class HumanoidFatigueBase(VecTask):
             print("normal")
             asset_file = "mjcf/amp_humanoid.xml"
 
-
         asset_options = gymapi.AssetOptions()
         asset_options.angular_damping = 0.01
         asset_options.max_angular_velocity = 100.0
@@ -411,7 +681,6 @@ class HumanoidFatigueBase(VecTask):
         self.symmetric_known_peak_torques = self.known_peak_torques * 1  # copy
         for left, right in SYMMETRIC_INDICES:
             self.symmetric_known_peak_torques[left] = self.symmetric_known_peak_torques[right] = torch.minimum(self.known_peak_torques[left], self.known_peak_torques[right])
-        # self.estimated_fudges = self.max_forces / self.symmetric_known_peak_torques
 
         self.torso_index = 0
         self.num_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
@@ -483,8 +752,6 @@ class HumanoidFatigueBase(VecTask):
 
         self._build_pd_action_offset_scale()
 
-        # theoretical upper limit of torque estimate is already known by joint limits and velocity limit (in isaac it's 64 RAD/s)
-
         pd_tar_limits_upper = self._action_to_pd_targets(torch.ones(1, self.num_dof, device=self.device))
         pd_tar_limits_lower = self._action_to_pd_targets(-torch.ones(1, self.num_dof, device=self.device))
         self.max_pd_tar_dof_pos_diff = torch.maximum(torch.abs(pd_tar_limits_upper - self.dof_limits_lower), torch.abs(self.dof_limits_upper - pd_tar_limits_lower))
@@ -531,7 +798,7 @@ class HumanoidFatigueBase(VecTask):
     def _compute_reward(self, actions):
         if self.cfg["env"]["regularize"] == "RC":
             print("RC")
-            self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean(self.RC, dim=1)
+            self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * (1 - torch.mean(self.RC, dim=1))
         elif self.cfg["env"]["regularize"] == "MF":
             print("MF")
             self.rew_buf[:] = -compute_humanoid_reward(self.obs_buf) * torch.mean(self.MF / 100, dim=1)
@@ -543,19 +810,15 @@ class HumanoidFatigueBase(VecTask):
             self.rew_buf[:] = torch.clip(compute_humanoid_reward(self.obs_buf) * self._root_states[:, 7], 0, 1)
         elif self.cfg["env"]["regularize"] == "TLMA_r":
             print("TLMA_r")
-            # for 1 - (TL - MA)
             self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean(1 - (self.TL - self.MA) / 100.0, dim=1)
         elif self.cfg["env"]["regularize"] == "TLMA_p":
             print("TLMA_p")
-            # for -(TL - MA) = MA - TL
             self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean((self.MA - self.TL) / 100.0, dim=1)
         elif self.cfg["env"]["regularize"] == "TLMA_f":
             print("TLMA_f")
-            # for -(TL - MA) = MA - TL
             self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean((self.TL - self.MA) / 100.0, dim=1)
         elif self.cfg["env"]["regularize"] == "TLMA_abs":
             print("TLMA_f")
-            # for (TL - MA)            
             self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean(torch.abs(self.MA - self.TL) / 100.0, dim=1)
         elif self.cfg["env"]["regularize"] == "TLMA_chi":
             self.rew_buf[:] = compute_humanoid_reward(self.obs_buf) * torch.mean(torch.exp(-((self.MA - self.TL) / 100)**2 / 0.12**2), dim=1)
@@ -651,15 +914,18 @@ class HumanoidFatigueBase(VecTask):
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
         self._terminate_buf[env_ids] = 0
+        # new episode for these envs, so logged traces can be segmented
+        if getattr(self, '_log_rc', False):
+            self._log_episode[env_ids] += 1
         return
-    
+
     def set_targets(self, env_ids):
         num_sets = len(env_ids)
         # set normalized target directions randomly with x in (0, 1) and y in (-1, 1)
         self.target_dir[env_ids] = torch.rand(num_sets, 2, device=self.device)
         self.target_dir[env_ids, 1] = self.target_dir[env_ids, 1] * 2 - 1
         self.target_dir[env_ids] = torch.nn.functional.normalize(self.target_dir[env_ids])
-        
+
     ### ORIGINAL PRE_PHYSICS_STEP FROM AMP (NOT USED)
 
     def _pre_physics_step(self, actions):
@@ -675,10 +941,13 @@ class HumanoidFatigueBase(VecTask):
             self.gym.set_dof_actuation_force_tensor(self.sim, force_tensor)
 
         return
-    
+
     ### OUR CHANGES WITH OUR MAIN CONTRIBUTIONS FOR FATIGUE MODELING
 
     def pre_physics_step(self, actions):
+        if self._time_fatigue:
+            self._sync()
+            self._t_step_mark = time.perf_counter()
         set_target_ids = (self.progress_buf % 100 == 0).nonzero(as_tuple=False).squeeze(-1)
         if len(set_target_ids) > 0:
             self.set_targets(set_target_ids)
@@ -691,15 +960,12 @@ class HumanoidFatigueBase(VecTask):
         if self.get_action_size() > self.num_dof:
             mods = self.actions[:, self.num_dof:]
             if self.cfg["env"]["useTorqueCoeff"]:
-                # print("useTorqueCoeff")
                 self.torque_mod = (mods[:, 0] + 1) * 0.5
                 mods = mods[:, 1:]
             if self.cfg["env"]["useStiffnessCoeff"]:
-                # print("useStiffnessCoeff")
                 self.stiffness_mod = (mods[:, 0] + 1) * 0.5
                 mods = mods[:, 1:]
             if self.cfg["env"]["useDampingCoeff"]:
-                # print("useDampingCoeff")
                 self.damping_mod = (mods[:, 0] + 1) * 0.5
                 mods = mods[:, 1:]
 
@@ -716,7 +982,17 @@ class HumanoidFatigueBase(VecTask):
 
             if self.cfg["env"]["useFatigue"]:
                 clipped_intended_torques = torch.clip(intended_torques, -self.symmetric_known_peak_torques, self.symmetric_known_peak_torques)  # the force the agent was going to use, ignoring fatigue
-                self.compute_3CC(clipped_intended_torques)
+                if self._time_fatigue:
+                    self._sync()
+                    _t0 = time.perf_counter()
+                if self.use_FGS:
+                    self.compute_FGS(clipped_intended_torques)
+                else:
+                    self.compute_3CC(clipped_intended_torques)
+                if self._time_fatigue:
+                    self._sync()
+                    self._t_fat_total += time.perf_counter() - _t0
+                    self._t_n += 1
 
             if self.cfg["env"]["randomizeEveryStep"]:
                 print("randomizeEveryStep")
@@ -753,7 +1029,6 @@ class HumanoidFatigueBase(VecTask):
                     dof_prop["stiffness"][:] = stiffness_np[i]
                     dof_prop["damping"][:] = damping_np[i]
                     self.gym.set_actor_dof_properties(env_ptr, handle, dof_prop)
-                    # print("B")
 
             self.gym.set_dof_position_target_tensor(self.sim, pd_tar_tensor)
         return
@@ -766,6 +1041,16 @@ class HumanoidFatigueBase(VecTask):
         self._compute_reward(self.actions)
         self._compute_reset()
 
+        if self._log_rc:
+            self._record_rc()
+
+        if self._time_fatigue and self._t_step_mark is not None:
+            self._sync()
+            self._t_step_total += time.perf_counter() - self._t_step_mark
+            self._t_step_mark = None
+            if self._time_report and self._t_n % self._time_report == 0:
+                self._report_timing()
+
         self.extras["terminate"] = self._terminate_buf
 
         # debug viz
@@ -777,6 +1062,7 @@ class HumanoidFatigueBase(VecTask):
     def render(self, **kwargs):
         if self.viewer and self.cfg["env"]["visualizeFatigue"]:
             self._visualize_fatigue()
+            self._visualize_stamina_bar()
         if self.viewer and self.camera_follow:
             self._update_camera()
 
@@ -840,7 +1126,7 @@ class HumanoidFatigueBase(VecTask):
     def _update_debug_viz(self):
         self.gym.clear_lines(self.viewer)
         return
-    
+
     def _visualize_fatigue(self):
         for i in range(self.num_envs):
             env = self.envs[i]
@@ -850,7 +1136,6 @@ class HumanoidFatigueBase(VecTask):
                     env, humanoid_handle, body_name)
                 if body_id != -1 and len(dofs['parents']) > 0:
                     BE = 0
-                    # print(BE)
                     for dof_name in dofs["parents"]:
                         dof_id = self.gym.find_actor_dof_handle(
                             env, humanoid_handle, dof_name)
@@ -873,29 +1158,149 @@ class HumanoidFatigueBase(VecTask):
                             env, humanoid_handle, "pelvis")
                         self.gym.set_rigid_body_color(env, humanoid_handle, body_id, gymapi.MESH_VISUAL, gymapi.Vec3(BE, 0.5, 0.5))
 
+    def _visualize_stamina_bar(self):
+        env_to_display_idx = 0
+        if self.viewer and self.num_envs > env_to_display_idx:
+            stamina_value = torch.mean(self.RC[env_to_display_idx, :]).item()
+            if self.progress_buf[env_to_display_idx] % 30 == 0:
+                print(f"Agent {env_to_display_idx} Stamina: {stamina_value:.2f}")
+        return
+
     def compute_3CC(self, forces):
-        # forces = torch.clip(forces, -self.max_forces, self.max_forces)
-        TL = abs(forces) / self.symmetric_known_peak_torques * 100
-        # TL = abs(forces) / self.force_estimate_upper_limit * 100
+        # Torque load as a percentage of the DOF's un-fatigued peak torque.
+        # Clamped for parity with compute_FGS; this is a no-op in practice
+        # because `forces` is already clipped to symmetric_known_peak_torques
+        # upstream in pre_physics_step, but it makes the two paths identical.
+        TL = abs(forces) / (self.symmetric_known_peak_torques + 1e-9) * 100.0
+        TL = torch.clamp(TL, 0.0, 100.0)
+
         LD = self.LD * 1
         LR = self.LR * 1
         dt = self.dt * 1
-        r = self.r * 1
-        R = self.R * 1
-        F = self.F * 1
+        r = self.r_base * 1
+        R = self.R_base * 1
+        F = self.F_base * 1
+
+        if self.load_dep_rate:
+            # u in [0,1]; multiplier is 1.0 at u = center, so the mean rate is
+            # unchanged when the mean normalised load equals the centre. F rises
+            # with load, R falls, matching the direction of the FGS fiber-type
+            # multipliers. Still ONE compartment: no reserve is withheld.
+            u = TL / 100.0
+            F = F * (1.0 + self._ld_span_F * (u - self._ld_center))
+            R = R * (1.0 + self._ld_span_R * (u - self._ld_center))
+            F = torch.clamp(F, min=1e-6)
+            R = torch.clamp(R, min=1e-9)
+
+        # Pre-update copies, so all three derivatives use the same state.
         MA = self.MA * 1
         MR = self.MR * 1
         MF = self.MF * 1
+
         Ct = torch.zeros_like(TL, requires_grad=False)
         Ct = torch.where((MA < TL) * (MR > (TL - MA)), LD * (TL - MA), Ct)
         Ct = torch.where((MA < TL) * (MR < (TL - MA)), LD * MR, Ct)
         Ct = torch.where(MA >= TL, LR * (TL - MA), Ct)
         rR = torch.where(MA >= TL, r * R, R)
+
+        # Euler step, then clamp to the [0, 100] pool as compute_FGS does.
         self.MR += dt * (-Ct + rR * MF)
         self.MA += dt * (Ct - F * MA)
-        self.MF += dt * (F * MA - rR * MF)
-        self.RC.data = 1 - self.MF / 100
+        self.MR.clamp_(0.0, 100.0)
+        self.MA.clamp_(0.0, 100.0)
+
+        # MF derived so that MA + MR + MF == 100 holds exactly after clamping.
+        self.MF.data = torch.clamp(100.0 - self.MA - self.MR, 0.0, 100.0)
+
+        self.RC.data = 1.0 - self.MF / 100.0
         self.TL.data = TL * 1
+
+    def compute_FGS(self, forces):
+        # forces: (num_envs, num_dof) - intended torques from policy/PD controller
+
+        # 1. Torque Load per DOF as a percentage of max known torque
+        TL_dof = abs(forces) / (self.symmetric_known_peak_torques.unsqueeze(0) + 1e-9) * 100.0
+        TL_dof = torch.clamp(TL_dof, 0.0, 100.0)
+        self.TL.data = TL_dof.clone()
+
+        # 2. Effective F, R, r per MU type per DOF
+        F_eff_per_dof_mu = self.F_base.unsqueeze(-1) * self.F_mu_multipliers.unsqueeze(0)
+        R_eff_per_dof_mu = self.R_base.unsqueeze(-1) * self.R_mu_multipliers.unsqueeze(0)
+        r_eff_per_dof_mu = self.r_base.unsqueeze(-1) * self.r_mu_multipliers.unsqueeze(0)
+
+        F_eff = F_eff_per_dof_mu.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        R_eff = R_eff_per_dof_mu.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        r_eff = r_eff_per_dof_mu.unsqueeze(0).repeat(self.num_envs, 1, 1)
+
+        # 3. Brain Effort and threshold recruitment
+        current_RC_fraction = self.RC.detach()
+        condition = (TL_dof <= current_RC_fraction * 100.0)
+        BE_dof = torch.where(condition,
+                             TL_dof / (current_RC_fraction + 1e-9),
+                             torch.full_like(TL_dof, 100.0))
+        BE_dof = torch.clamp(BE_dof, 0.0, 100.0)
+
+        TL_mu = torch.zeros_like(self.MA_mu, device=self.device)
+
+        if self.num_mu_types == 3:
+            active_mask_type_I = (BE_dof > 0.0)
+            TL_mu[:, :, 0] = torch.where(active_mask_type_I, TL_dof, torch.zeros_like(TL_dof))
+
+            active_mask_type_IIa = (BE_dof > self.mu_be_recruitment_thresholds[0])
+            TL_mu[:, :, 1] = torch.where(active_mask_type_IIa, TL_dof, torch.zeros_like(TL_dof))
+
+            active_mask_type_IIx = (BE_dof > self.mu_be_recruitment_thresholds[1])
+            TL_mu[:, :, 2] = torch.where(active_mask_type_IIx, TL_dof, torch.zeros_like(TL_dof))
+
+            # windowed recruitment duty cycle -> CSV (see _accumulate_duty)
+            if self._log_duty:
+                self._accumulate_duty([active_mask_type_I,
+                                       active_mask_type_IIa,
+                                       active_mask_type_IIx])
+        else:
+            TL_mu = TL_dof.unsqueeze(-1).repeat(1, 1, self.num_mu_types)
+
+        LD = self.LD
+        LR = self.LR
+        dt = self.dt
+        total_fibers_per_type_pool = 100.0
+
+        MA_mu_curr = self.MA_mu
+        MR_mu_curr = self.MR_mu
+        MF_mu_curr = self.MF_mu
+
+        Ct = torch.zeros_like(TL_mu, device=self.device)
+
+        activate_condition = (MA_mu_curr < TL_mu)
+        needed_for_TL = TL_mu - MA_mu_curr
+
+        can_activate_fully = activate_condition & (MR_mu_curr >= needed_for_TL)
+        Ct = torch.where(can_activate_fully, LD * needed_for_TL, Ct)
+
+        can_activate_partially = activate_condition & (MR_mu_curr < needed_for_TL)
+        Ct = torch.where(can_activate_partially, LD * MR_mu_curr, Ct)
+
+        recover_condition = (MA_mu_curr >= TL_mu)
+        Ct = torch.where(recover_condition, LR * (TL_mu - MA_mu_curr), Ct)
+
+        rR_eff = r_eff * R_eff
+
+        dMR_dt = -Ct + rR_eff * MF_mu_curr
+        dMA_dt =  Ct - F_eff * MA_mu_curr
+        dMF_dt =  F_eff * MA_mu_curr - rR_eff * MF_mu_curr
+
+        self.MR_mu = torch.clamp(MR_mu_curr + dt * dMR_dt, 0.0, total_fibers_per_type_pool)
+        self.MA_mu = torch.clamp(MA_mu_curr + dt * dMA_dt, 0.0, total_fibers_per_type_pool)
+        self.MF_mu = torch.clamp(total_fibers_per_type_pool - self.MA_mu - self.MR_mu, 0.0, total_fibers_per_type_pool)
+
+        RC_mu_type_contribution = (1.0 - self.MF_mu / total_fibers_per_type_pool)
+        RC_mu_type_contribution = torch.clamp(RC_mu_type_contribution, 0.0, 1.0)
+
+        self.RC.data = torch.sum(RC_mu_type_contribution * self.mu_percentages_per_dof.unsqueeze(0), dim=-1)
+
+        self.MF.data = torch.sum(self.MF_mu * self.mu_percentages_per_dof.unsqueeze(0), dim=-1)
+        self.MA.data = torch.sum(self.MA_mu * self.mu_percentages_per_dof.unsqueeze(0), dim=-1)
+        self.MR.data = torch.sum(self.MR_mu * self.mu_percentages_per_dof.unsqueeze(0), dim=-1)
 
 
 #####################################################################
@@ -905,8 +1310,6 @@ class HumanoidFatigueBase(VecTask):
 @torch.jit.script
 def dof_to_obs(pose):
     # type: (Tensor) -> Tensor
-    # dof_obs_size = 64
-    # dof_offsets = [0, 3, 6, 9, 12, 13, 16, 19, 20, 23, 24, 27, 30, 31, 34]
     dof_obs_size = 52
     dof_offsets = [0, 3, 6, 9, 10, 13, 14, 17, 18, 21, 24, 25, 28]
     num_joints = len(dof_offsets) - 1
@@ -976,9 +1379,7 @@ def compute_humanoid_observations(root_states, dof_pos, dof_vel, key_body_pos, l
 @torch.jit.script
 def compute_humanoid_reward(obs_buf):
     # type: (Tensor) -> Tensor
-    # reward = torch.ones_like(obs_buf[:, 0])
     root_dir = torch.nn.functional.normalize(obs_buf[:, 1:3])
-    # print(root_dir)
     target_dir = obs_buf[:, -2:]
     dir_reward = (root_dir[:, 0] * target_dir[:, 0] + root_dir[:, 1] * target_dir[:, 1] + 1) * 0.5
     reward = dir_reward

@@ -146,14 +146,17 @@ class HumanoidFatigue(HumanoidFatigueBase):
         if self.cfg["env"]["record_poses"]:
             f = self._state_to_vis_frame()
             self.json_frame_buffers.append(f)
-            if self.progress_buf[0] >= self.max_episode_length - 1:
+            if self.progress_buf[0] >= self.max_episode_length - 1 or self.reset_buf[0] == 1:
                 json_filename = self.cfg["env"]["motion_file"][:-4] \
+                    + "_G=" + repr(self.local_group_fatigue) \
+                    + "_FGS=" + repr(self.use_FGS) \
                     + "_F=" + repr(self.cfg["env"]["fatigueF"]) \
                     + "_R=" + repr(self.cfg["env"]["fatigueR"]) \
                     + "_r=" + repr(self.cfg["env"]["fatigue_r"]) + ".json"
                 with open(json_filename, 'wt') as file:
                     json.dump({"poseBuffer": self.json_frame_buffers}, file)
                 print(f"Saved JSON file as {json_filename}")
+                return
 
         if self.enable_streaming:
             self._state_to_vis_frame()
@@ -227,10 +230,10 @@ class HumanoidFatigue(HumanoidFatigueBase):
             q = rotations[i]
             f["rotations"].append({"x": q[0], "y": q[1], "z": q[2], "w": q[3]})
 
-        f["ma"] = self.MA[self.vis_env_id, :].tolist()
-        f["mf"] = self.MF[self.vis_env_id, :].tolist()
-        f["mr"] = self.MR[self.vis_env_id, :].tolist()
-        f["tl"] = self.TL[self.vis_env_id, :].tolist()
+        f["ma"] = self.MA[0, :].tolist()
+        f["mf"] = self.MF[0, :].tolist()
+        f["mr"] = self.MR[0, :].tolist()
+        f["tl"] = self.TL[0, :].tolist()
         # f["reset"] = False
         f["reset"] = self.sending_reset
         if self.sending_reset:
@@ -267,8 +270,21 @@ class HumanoidFatigue(HumanoidFatigueBase):
         self._terminate_buf[env_ids] = 0
 
         self.set_targets(env_ids)
-
-        if torch.rand(1) < float(self.cfg["env"]["randomizeFatigueProb"]):
+        
+        init_mf = float(self.cfg["env"].get("initialMF", -1.0))
+        if init_mf >= 0.0:
+            # Fixed initial depletion, for matching protocols that fatigue the
+            # subject beforehand and then record (e.g. DUO-Gait).
+            self.MF[env_ids, :] = init_mf
+            self.MA[env_ids, :] = 0
+            self.MR[env_ids, :] = 100 - init_mf
+            self.TL[env_ids, :] = 0
+            self.RC[env_ids, :] = 1 - init_mf / 100.0
+            if getattr(self, 'use_FGS', False):
+                self.MF_mu[env_ids] = init_mf
+                self.MA_mu[env_ids] = 0
+                self.MR_mu[env_ids] = 100 - init_mf
+        elif torch.rand(1) < float(self.cfg["env"]["randomizeFatigueProb"]):
             #print("random")
             self.MR[env_ids, :] = Uniform(0, 100).sample(self.MR[env_ids, :].shape).to(self.device)
             self.MF[env_ids, :] = Uniform(0, 100 - self.MR[env_ids, :]).sample().to(self.device)
