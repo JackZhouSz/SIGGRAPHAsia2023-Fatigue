@@ -51,7 +51,12 @@ If you find this code useful in your research, please cite:
 
 This repository contains an implementation of the code for our [SIGGRAPH Asia paper](https://dl.acm.org/doi/pdf/10.1145/3610548.3618176) "Discovering Fatigued Animations for Virtual Character Animation", and its extension published at **MIG 2026**, which replaces the single-pool 3CC-r model with a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
 
-**Note on defaults:** `useFGS` and `localGroupFatigue` now default to `True`. To reproduce the original SIGGRAPH Asia 2023 behaviour (uniform per-DoF 3CC-r), append `++task.env.useFGS=False ++task.env.localGroupFatigue=False` to the commands below.
+The code is split into two folders:
+
+- `[SIGGRAPH Asia 2023] Fatigue`: the original code for the SIGGRAPH Asia 2023 paper.
+- `[SIGGRAPH MIG 2026] Fatigue`: the MIG 2026 code, including FGS. The commands below work in either folder.
+
+**Note on defaults:** in the MIG 2026 folder, `useFGS` and `localGroupFatigue` default to `True`. To get the original 3CC-r behaviour there, append `++task.env.useFGS=False ++task.env.localGroupFatigue=False` to the commands below.
 
 ### Installation
 
