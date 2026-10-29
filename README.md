@@ -1,4 +1,32 @@
-# [SIGGRAPH Asia 2023] Discovering Fatigued Movements for Virtual Character Animation
+# Fatigued Movements for Virtual Character Animation
+
+This repository contains the code for our fatigue papers:
+
+- **[SIGGRAPH Asia 2023]** Discovering Fatigued Movements for Virtual Character Animation
+- **[MIG 2026]** TODO: MIG 2026 paper title
+
+<img src ="Media/teaser.gif" width="100%">
+
+------------
+
+## [MIG 2026] TODO: MIG 2026 paper title
+
+<p align="center">
+TODO: authors</br>
+<b>MIG 2026 Conference Paper</b>
+</p>
+
+<p align="center">
+<b>
+TODO: Website | Paper | Video
+</b>
+</p>
+
+This paper extends the SIGGRAPH Asia 2023 work by replacing the single-pool 3CC-r model with a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
+
+------------
+
+## [SIGGRAPH Asia 2023] Discovering Fatigued Movements for Virtual Character Animation
 
 <p align="center">
 <a href="https://people.mpi-inf.mpg.de/~ncheema/">Noshaba Cheema</a> | 
@@ -12,8 +40,6 @@
 <b>SIGGRAPH Asia 2023 Conference Paper</b>
 </p>
 
-<img src ="Media/teaser.gif" width="100%">
-
 <p align="center">
 <b>
 <a href="https://vcai.mpi-inf.mpg.de/projects/FatiguedMovements/">Website</a> | 
@@ -21,8 +47,6 @@
 <a href="https://www.youtube.com/watch?v=FVOWVz0k1dI">Video</a>
 </b>
 </p>
-
-------------
 
 <p align="center">
 <b>
@@ -45,16 +69,16 @@ If you find this code useful in your research, please cite:
   booktitle={ACM SIGGRAPH 2023 Conference Proceedings},
   year = {2023}
 }
+
+TODO: MIG 2026 BibTeX
 ```
 
 ### About this repository
 
-This repository contains an implementation of the code for our [SIGGRAPH Asia paper](https://dl.acm.org/doi/pdf/10.1145/3610548.3618176) "Discovering Fatigued Animations for Virtual Character Animation", and its extension published at **MIG 2026**, which replaces the single-pool 3CC-r model with a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
-
 The code is split into two folders:
 
 - `[SIGGRAPH Asia 2023] Fatigue`: the original code for the SIGGRAPH Asia 2023 paper.
-- `[SIGGRAPH MIG 2026] Fatigue`: the MIG 2026 code, including FGS. The commands below work in either folder.
+- `[SIGGRAPH MIG 2026] Fatigue`: the MIG 2026 code, including FGS. The pre-trained model, training and Unity commands below work in either folder; the FGS commands need the MIG 2026 folder.
 
 **Note on defaults:** in the MIG 2026 folder, `useFGS` and `localGroupFatigue` default to `True`. To get the original 3CC-r behaviour there, append `++task.env.useFGS=False ++task.env.localGroupFatigue=False` to the commands below.
 
