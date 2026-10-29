@@ -3,26 +3,37 @@
 This repository contains the code for our fatigue papers:
 
 - **[SIGGRAPH Asia 2023]** Discovering Fatigued Movements for Virtual Character Animation
-- **[MIG 2026]** TODO: MIG 2026 paper title
+- **[MIG 2026]** Fatigue++: Spatial Resolution in Fatigue Models for Physics-Based Characters
 
 <img src ="Media/teaser.gif" width="100%">
 
 ------------
 
-## [MIG 2026] TODO: MIG 2026 paper title
+## [MIG 2026] Fatigue++: Spatial Resolution in Fatigue Models for Physics-Based Characters
 
 <p align="center">
-TODO: authors</br>
+<a href="https://people.mpi-inf.mpg.de/~ncheema/">Noshaba Cheema</a> | 
+Sidharth Nair |
+<a href="https://people.mpi-inf.mpg.de/~theobalt/">Christian Theobalt</a> | 
+<a href="https://graphics.cg.uni-saarland.de/people/slusallek.html">Philipp Slusallek</a> </br>
 <b>MIG 2026 Conference Paper</b>
 </p>
 
 <p align="center">
 <b>
-TODO: Website | Paper | Video
+<a href="https://doi.org/10.1145/3828647.3857305">Technical Paper</a>
 </b>
 </p>
 
-This paper extends the SIGGRAPH Asia 2023 work by replacing the single-pool 3CC-r model with a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
+<p align="center">
+<b>
+Abstract
+</b>
+</br>
+<i>Fatigue fundamentally shapes human movement: as exertion accumulates, strength declines, coordination degrades, and movement strategies adapt to preserve performance. Critically, these effects are not uniform across the body: limbs fatigue at different rates, distinct muscle fiber types exhaust and recover on different timescales, and effort is continuously redistributed in response. Physics-based character control has begun to model cumulative fatigue directly, most efficiently by embedding a Three-Compartment Controller (3CC) in the torque limits of a reinforcement learning policy. Such models already resolve fatigue per degree of freedom, but assign every joint identical fatigue and recovery coefficients, so spatial variation arises only from variation in mechanical load. How much of human fatigued behavior this leaves unmodeled has not been measured. This paper asks at what spatial resolution fatigue must be represented in order to reproduce the characteristic adaptations of fatigued human movement. We present Fatigue++, which extends 3CC-r along two axes: body-group-specific fatigue and recovery coefficients, and a decomposition of each degree of freedom into three motor unit populations (Type I (slow), Type IIa (fast fatigue-resistant), and Type IIx (fast-fatigable)) recruited in threshold order following Henneman's Size Principle, which to our knowledge has not previously been modeled in physics-based character animation. We evaluate a ladder of representations under matched parameters and matched training: per-DoF 3CC-r with uniform coefficients, per-group coefficients, and the full Fine-Grained Stamina (FGS) model. This isolates what each increment of spatial resolution contributes, separating the effect of heterogeneous parameters from that of the motor unit decomposition itself. We find that the two increments contribute differently. Body-group coefficients account for limb-specific fatigue behaviour, including the differential arm and leg recovery that produces naturalistic rest posture; the motor unit decomposition adds nothing further there. What it governs instead is when capacity is spent: at matched total exposure of the working limb, threshold recruitment defers depletion to half capacity by a factor of 2.2 and roughly doubles the repetitions sustained, holding high-threshold populations in reserve and drawing on them as capacity declines. A single compartment whose rate varies with load recovers part of this effect, but not most of it: withholding capacity behind a recruitment threshold is not equivalent to slowing the rate at low load. Independently of spatial resolution, we introduce an energy-aware reward that re-weights task performance against exertion as stamina declines. This governs the temporal dimension of effort (pacing, the length of rest intervals, and the physical plausibility of peak torque expenditure) and we show it is complementary to, rather than a substitute for, spatial resolution in the fatigue model. Fatigue++ is evaluated on acrobatic skills, locomotion, and a non-humanoid quadruped. It requires no explicitly captured fatigued motion data, runs in real time without musculoskeletal simulation, and applies without modification across character embodiments and unseen fatigue parameter configurations.
+</p></i>
+
+This paper extends the SIGGRAPH Asia 2023 work with body-group-specific fatigue coefficients and a fiber-type motor-unit model (**FGS**). See [Fiber-type fatigue model (FGS)](#fiber-type-fatigue-model-fgs-mig-2026) below.
 
 ------------
 
@@ -60,7 +71,7 @@ Abstract
 
 ### BibTex
 
-If you find this code useful in your research, please cite:
+If you find this code useful in your research, please cite the relevant paper(s):
 
 ```
 @inproceedings{cheema2023fatigue,
@@ -70,7 +81,15 @@ If you find this code useful in your research, please cite:
   year = {2023}
 }
 
-TODO: MIG 2026 BibTeX
+@inproceedings{cheema2026fatigueplusplus,
+  title = {Fatigue++: Spatial Resolution in Fatigue Models for Physics-Based Characters},
+  author = {Cheema, Noshaba and Nair, Sidharth and Theobalt, Christian and Slusallek, Philipp},
+  booktitle = {The 19th ACM SIGGRAPH Conference on Motion, Interaction, and Games (MIG '26)},
+  publisher = {ACM},
+  address = {Charleston, SC, USA},
+  doi = {10.1145/3828647.3857305},
+  year = {2026}
+}
 ```
 
 ### About this repository
@@ -241,14 +260,14 @@ All parameters are set with `++task.env.<name>=<value>`. Lists use double quotes
 <details>
 <summary><b>Resolution ablation</b></summary>
 
-`run_ablation.sh` runs the tornado kick under four fatigue models with the same checkpoint, seed and episode length:
+`run_ablation.sh` runs the tornado kick under the four rungs of the resolution ladder (paper Sec. 6.4, Tab. 1) with the same checkpoint, seed and episode length:
 
 | Rung | Flags | Model |
 |---|---|---|
 | (i) `uniform` | `useFGS=False localGroupFatigue=False` | Per-DoF 3CC-r, uniform coefficients (SIGGRAPH Asia 2023). |
-| (0) `loaddep` | `useFGS=False localGroupFatigue=True loadDependentRate=True` | Single pool whose F and R scale with instantaneous load over the same range as the FGS multipliers. |
 | (ii) `pergroup` | `useFGS=False localGroupFatigue=True` | Per-group coefficients, single pool. |
-| (iii) `fgs` | `useFGS=True localGroupFatigue=True` | Full FGS. |
+| (iii) `loaddep` | `useFGS=False localGroupFatigue=True loadDependentRate=True` | Single pool whose F and R scale with instantaneous load over the same range as the FGS multipliers. |
+| (iv) `fgs` | `useFGS=True localGroupFatigue=True` | Full FGS. |
 
 <pre>
 bash run_ablation.sh          # all rungs
